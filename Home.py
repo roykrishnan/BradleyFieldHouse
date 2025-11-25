@@ -1608,7 +1608,7 @@ def create_test_leaderboard(perf_df, test_code, display_name):
               label=f'Group Average: {group_avg:.2f} {units}')
     
     # Styling
-    ax.set_title(f'Bradley Fieldhouse Baseball\n{display_name} - {selected_metric}', 
+    ax.set_title(f'Bradley Field House Baseball\n{display_name} - {selected_metric}', 
                 fontsize=16, pad=20, fontweight='bold')
     ax.set_ylabel(f'{selected_metric} ({units})', fontsize=12)
     ax.set_xlabel('Players (Ranked by Performance)', fontsize=12)
