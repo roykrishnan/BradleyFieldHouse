@@ -391,7 +391,7 @@ def load_rapsodo_data():
     
     df = pd.DataFrame(all_player_data)
     
-    # Calculate Bonnies Stuff+ for each pitch type
+    # Calculate Bradley Stuff+ for each pitch type
     pitch_types = ['Fastball', 'ChangeUp', 'Slider']
     
     for pitch_type in pitch_types:
@@ -401,7 +401,7 @@ def load_rapsodo_data():
             # Create temporary dataframe for this pitch type
             pitch_df = df[df[velocity_col].notna()].copy()
             if len(pitch_df) > 0:
-                # Calculate Bonnies Stuff+ for this pitch type
+                # Calculate Bradley Stuff+ for this pitch type
                 stuff_plus_col = f'{pitch_type}_Stuff+'
                 pitch_df[stuff_plus_col] = calculate_bonnies_stuff_plus_for_pitch_type(pitch_df, pitch_type)
                 
@@ -1001,8 +1001,14 @@ def get_access_token():
         "client_secret": VALD_CONFIG["client_secret"]
     }
     
-    response = requests.post(VALD_CONFIG["token_url"], data=token_data)
-    return response.json()["access_token"] if response.ok else None
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    response = requests.post(VALD_CONFIG["token_url"], data=token_data, headers=headers)
+    
+    if response.ok:
+        return response.json()["access_token"]
+    else:
+        st.error(f"Failed to get access token: {response.status_code}")
+        return None
 
 @st.cache_data(ttl=1800)
 def load_bonnies_players_from_csv():
@@ -1067,6 +1073,7 @@ def fetch_all_profiles():
         return {}
     
     headers = {"Authorization": f"Bearer {token}"}
+    # CORRECTED: Simple /profiles endpoint without version path
     profiles_url = f"{VALD_CONFIG['profiles_base_url']}/profiles?tenantId={VALD_CONFIG['tenant_id']}"
     
     try:
@@ -1097,6 +1104,10 @@ def fetch_all_profiles():
                     }
                 
                 return profiles_dict
+            else:
+                st.error("No profiles found in API response")
+        else:
+            st.error(f"Failed to fetch profiles: {response.status_code}")
         return {}
     except Exception as e:
         st.error(f"Error fetching profiles: {str(e)}")
@@ -1122,6 +1133,7 @@ def get_team_id():
         return None
     
     headers = {"Authorization": f"Bearer {token}"}
+    # CORRECTED: Direct /v2019q3/teams path
     teams_url = f"{VALD_CONFIG['forcedecks_base_url']}/v2019q3/teams"
     
     try:
@@ -1131,30 +1143,44 @@ def get_team_id():
             teams = response.json()
             if teams and len(teams) > 0:
                 return teams[0].get('id') or teams[0].get('teamId')
+            else:
+                st.error("No teams found in API response")
+        else:
+            st.error(f"Failed to fetch team ID: {response.status_code}")
         return None
-    except Exception:
+    except Exception as e:
+        st.error(f"Error fetching team ID: {str(e)}")
         return None
 
 @st.cache_data(ttl=600)
-def fetch_forcedecks_tests(profile_ids, modified_from_date):
-    """Fetch ForceDecks test data using /tests endpoint"""
+def fetch_available_test_dates(profile_ids, start_date="2024-01-01"):
+    """
+    Fetch all available test dates from the API
+    
+    Args:
+        profile_ids (list): List of profile IDs to filter for
+        start_date (str): Start date to search from in 'YYYY-MM-DD' format
+    
+    Returns:
+        list: List of unique dates that have tests
+    """
     if not profile_ids:
-        return pd.DataFrame()
+        return []
     
     token = get_access_token()
     if not token:
-        return pd.DataFrame()
+        return []
     
     headers = {"Authorization": f"Bearer {token}"}
-    modified_date = f"{modified_from_date}T00:00:00.000Z"
+    modified_date = f"{start_date}T00:00:00.000Z"
     
     initial_url = f"{VALD_CONFIG['forcedecks_base_url']}/tests?tenantId={VALD_CONFIG['tenant_id']}&modifiedFromUtc={modified_date}"
     
     try:
-        all_tests = []
+        all_dates = set()
         current_url = initial_url
         page_count = 0
-        max_pages = 10
+        max_pages = 50
         
         while current_url and page_count < max_pages:
             page_count += 1
@@ -1164,35 +1190,104 @@ def fetch_forcedecks_tests(profile_ids, modified_from_date):
                 break
             
             if response.ok:
+                data = response.json()
+                tests = data if isinstance(data, list) else data.get("tests", [])
+                
+                if len(tests) > 0:
+                    # Filter for our profile IDs and extract dates
+                    for test in tests:
+                        if test.get('profileId') in profile_ids:
+                            modified_date_utc = test.get('modifiedDateUtc')
+                            if modified_date_utc:
+                                test_date = pd.to_datetime(modified_date_utc, utc=True).date()
+                                all_dates.add(test_date)
+                    
+                    # Pagination
+                    last_test = tests[-1]
+                    last_modified = last_test.get('modifiedDateUtc')
+                    if last_modified:
+                        last_dt = datetime.fromisoformat(last_modified.replace('Z', '+00:00'))
+                        next_dt = last_dt + timedelta(microseconds=1)
+                        next_modified = next_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')[:-3] + 'Z'
+                        current_url = f"{VALD_CONFIG['forcedecks_base_url']}/tests?tenantId={VALD_CONFIG['tenant_id']}&modifiedFromUtc={next_modified}"
+                    else:
+                        break
+                else:
+                    break
+            else:
+                st.error(f"API Error: {response.status_code}")
+                break
+        
+        # Convert to sorted list (most recent first)
+        return sorted(list(all_dates), reverse=True)
+        
+    except Exception as e:
+        st.error(f"Error fetching test dates: {str(e)}")
+        return []
+    
+@st.cache_data(ttl=600)
+def fetch_forcedecks_tests(modified_from_date, filter_profile_ids=None):
+    """
+    Fetch ForceDecks test data using /tests endpoint with pagination
+    
+    Args:
+        modified_from_date (str): Date string in 'YYYY-MM-DD' format
+        filter_profile_ids (list, optional): If provided, filter results to these profile IDs
+    
+    Returns:
+        pd.DataFrame: DataFrame with test data
+    """
+    token = get_access_token()
+    if not token:
+        return pd.DataFrame()
+    
+    headers = {"Authorization": f"Bearer {token}"}
+    modified_date = f"{modified_from_date}T00:00:00.000Z"
+    
+    # Direct /tests path - gets ALL tests for the tenant
+    initial_url = f"{VALD_CONFIG['forcedecks_base_url']}/tests?tenantId={VALD_CONFIG['tenant_id']}&modifiedFromUtc={modified_date}"
+    
+    try:
+        all_tests = []
+        current_url = initial_url
+        page_count = 0
+        max_pages = 50
+        
+        while current_url and page_count < max_pages:
+            page_count += 1
+            response = requests.get(current_url, headers=headers)
+            
+            if response.status_code == 204:
+                # No content
+                break
+            
+            if response.ok:
                 try:
                     data = response.json()
                     tests = data if isinstance(data, list) else data.get("tests", [])
                     
                     if len(tests) > 0:
-                        filtered_tests = [test for test in tests if test.get('profileId') in profile_ids]
-                        all_tests.extend(filtered_tests)
+                        # Add all tests (no filtering by profile IDs here)
+                        all_tests.extend(tests)
                         
-                        if len(tests) > 0:
-                            last_test = tests[-1]
-                            last_modified = last_test.get('modifiedDateUtc')
-                            if last_modified:
-                                from datetime import datetime, timedelta
-                                last_dt = datetime.fromisoformat(last_modified.replace('Z', '+00:00'))
-                                next_dt = last_dt + timedelta(microseconds=1)
-                                next_modified = next_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')[:-3] + 'Z'
-                                current_url = f"{VALD_CONFIG['forcedecks_base_url']}/tests?tenantId={VALD_CONFIG['tenant_id']}&modifiedFromUtc={next_modified}"
-                            else:
-                                current_url = None
+                        # Pagination logic
+                        last_test = tests[-1]
+                        last_modified = last_test.get('modifiedDateUtc')
+                        if last_modified:
+                            last_dt = datetime.fromisoformat(last_modified.replace('Z', '+00:00'))
+                            next_dt = last_dt + timedelta(microseconds=1)
+                            next_modified = next_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')[:-3] + 'Z'
+                            current_url = f"{VALD_CONFIG['forcedecks_base_url']}/tests?tenantId={VALD_CONFIG['tenant_id']}&modifiedFromUtc={next_modified}"
                         else:
                             current_url = None
                     else:
                         break
                         
                 except Exception as e:
-                    st.error(f"Error parsing response: {str(e)}")
+                    st.error(f"Error parsing test data: {str(e)}")
                     break
             else:
-                st.error(f"API Error {response.status_code}")
+                st.error(f"API Error fetching tests: {response.status_code}")
                 break
         
         if all_tests:
@@ -1201,6 +1296,11 @@ def fetch_forcedecks_tests(profile_ids, modified_from_date):
                 df['modifiedDateUtc'] = pd.to_datetime(df['modifiedDateUtc'], utc=True)
                 df['date'] = df['modifiedDateUtc'].dt.date
                 df['time'] = df['modifiedDateUtc'].dt.time
+            
+            # Optional filtering after we have all the data
+            if filter_profile_ids is not None and len(filter_profile_ids) > 0:
+                df = df[df['profileId'].isin(filter_profile_ids)].copy()
+            
             return df
         else:
             return pd.DataFrame()
@@ -1224,6 +1324,7 @@ def fetch_test_trials_batch(team_id, test_ids):
     
     for test_id in test_ids:
         try:
+            # CORRECTED: /v2019q3/teams/{teamId}/tests/{testId}/trials path
             trials_url = f"{VALD_CONFIG['forcedecks_base_url']}/v2019q3/teams/{team_id}/tests/{test_id}/trials"
             response = requests.get(trials_url, headers=headers)
             
@@ -1235,7 +1336,8 @@ def fetch_test_trials_batch(team_id, test_ids):
                         trial['testId'] = test_id
                     all_trials.extend(trials_data)
         
-        except Exception:
+        except Exception as e:
+            st.warning(f"Error fetching trials for test {test_id}: {str(e)}")
             continue
     
     if all_trials:
@@ -1304,27 +1406,35 @@ def create_leaderboard_dashboard(perf_df, bonnies_players):
         st.warning("No performance data available")
         return
     
-    # Add player names and handedness
-    profile_id_to_name = {}
-    for name, info in bonnies_players.items():
-        # Match by athleteId or profileId
-        for _, row in perf_df.iterrows():
-            athlete_id = row.get('athleteId') or row.get('profileId')
-            if athlete_id and athlete_id in [info.get('player_id'), name]:
-                profile_id_to_name[athlete_id] = name
-                break
+    # Add player names - try to match with CSV, but fallback to VALD profile names
+    if 'name_to_profile_id' in st.session_state and st.session_state.name_to_profile_id:
+        # Try to match using CSV names
+        profile_id_to_name = {v: k for k, v in st.session_state.name_to_profile_id.items()}
+        perf_df['player_name'] = perf_df['profileId'].map(profile_id_to_name)
     
-    # If direct matching didn't work, try profile matching
-    if not profile_id_to_name:
-        # This would need the profile matching from session state
-        if 'name_to_profile_id' in st.session_state:
-            profile_id_to_name = {v: k for k, v in st.session_state.name_to_profile_id.items()}
+    # Fallback: Use VALD profile names for any unmatched profiles
+    if 'all_profiles' in st.session_state and st.session_state.all_profiles:
+        vald_names = {pid: profile['fullName'] for pid, profile in st.session_state.all_profiles.items()}
+        # Fill in any missing names with VALD names
+        perf_df['player_name'] = perf_df['player_name'].fillna(perf_df['profileId'].map(vald_names))
     
-    perf_df['player_name'] = perf_df['profileId'].map(profile_id_to_name)
+    # Final fallback: use profileId if we still don't have a name
+    perf_df['player_name'] = perf_df['player_name'].fillna(perf_df['profileId'])
     
-    # Add handedness
-    name_to_handedness = {name: info['handedness'] for name, info in bonnies_players.items()}
-    perf_df['handedness'] = perf_df['player_name'].map(name_to_handedness)
+    # Filter out any rows that still don't have a player name (shouldn't happen now)
+    perf_df = perf_df[perf_df['player_name'].notna()].copy()
+    
+    if perf_df.empty:
+        st.error("No player names could be assigned to the data")
+        return
+    
+    # Add handedness - try from CSV first, default to 'Unknown'
+    if bonnies_players:
+        name_to_handedness = {name: info['handedness'] for name, info in bonnies_players.items()}
+        perf_df['handedness'] = perf_df['player_name'].map(name_to_handedness)
+    
+    # Default handedness to 'RHP' for unmatched players
+    perf_df['handedness'] = perf_df['handedness'].fillna('RHP')
     
     # Clean up test types - fix SLJ to SJ
     perf_df['testType'] = perf_df['testType'].replace('SLJ', 'SJ')
@@ -1495,7 +1605,7 @@ def create_test_leaderboard(perf_df, test_code, display_name):
               label=f'Group Average: {group_avg:.2f} {units}')
     
     # Styling
-    ax.set_title(f'St. Bonaventure Baseball\n{display_name} - {selected_metric}', 
+    ax.set_title(f'Bradley Fieldhouse Baseball\n{display_name} - {selected_metric}', 
                 fontsize=16, pad=20, fontweight='bold')
     ax.set_ylabel(f'{selected_metric} ({units})', fontsize=12)
     ax.set_xlabel('Players (Ranked by Performance)', fontsize=12)
@@ -1651,25 +1761,32 @@ def main():
     
     # Date selection
     selected_date = st.date_input(
-        "Select Testing Date (First Test 2025/09/06)",
-        value=date(2025, 9, 6),
-        min_value=date(2024, 1, 1),
+        "Select Testing Date",
+        value=date(2025, 9, 18),
+        min_value=date(2025, 8, 1),
         max_value=date.today()
     )
     
     if st.button("Load Force Plate Data", type="primary"):
-        profile_ids = list(st.session_state.name_to_profile_id.values())
         team_id = get_team_id()
         
+        if not team_id:
+            st.error("Could not get team ID from VALD API.")
+            return
+        
         with st.spinner("Loading force plate data..."):
-            # Get test summaries
-            df = fetch_forcedecks_tests(profile_ids, selected_date.strftime('%Y-%m-%d'))
+            # Fetch ALL tests for the tenant (no profile filtering)
+            df = fetch_forcedecks_tests(selected_date.strftime('%Y-%m-%d'))
             
             if not df.empty:
-                # Filter for selected date
+                st.info(f"Retrieved {len(df)} total tests from API")
+                
+                # Filter for selected date only
                 df_filtered = df[df['date'] == selected_date].copy()
                 
                 if not df_filtered.empty:
+                    st.info(f"Found {len(df_filtered)} tests on {selected_date}")
+                    
                     # Get trial data
                     test_ids = df_filtered['testId'].unique().tolist()
                     trials_df = fetch_test_trials_batch(team_id, test_ids)
@@ -1680,21 +1797,24 @@ def main():
                         
                         if not perf_df.empty:
                             st.session_state.performance_data = perf_df
-                            st.success(f"Loaded {len(perf_df)} performance measurements from {len(df_filtered)} tests")
+                            st.success(f"✅ Loaded {len(perf_df)} performance measurements from {len(df_filtered)} tests on {selected_date}")
                         else:
                             st.error("No performance metrics extracted from trial data")
                     else:
-                        st.error("No trial data found")
+                        st.error("No trial data found for these tests")
                 else:
-                    st.warning(f"No test data found for {selected_date}")
+                    # Show what dates ARE available
+                    available_dates = sorted(df['date'].unique())
+                    st.warning(f"❌ No test data found for {selected_date}")
+                    st.info(f"💡 Available dates: {', '.join([str(d) for d in available_dates[:10]])}")
             else:
-                st.warning("No test data found")
+                st.warning(f"No test data found starting from {selected_date}")
     
     # Display leaderboards if data is available
     if 'performance_data' in st.session_state and not st.session_state.performance_data.empty:
         create_leaderboard_dashboard(st.session_state.performance_data, st.session_state.bonnies_players)
     else:
-        st.info("Click 'Load Force Plate Data' to generate leaderboards for the selected date")
+        st.info("👆 Click 'Load Force Plate Data' to generate leaderboards for the selected date")
 
 if __name__ == "__main__":
     main()

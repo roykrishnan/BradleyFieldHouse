@@ -1228,18 +1228,119 @@ def display_player_force_plate_section(player_name):
     # Find player's VALD profile ID
     player_profile_id = find_player_vald_profile_id(player_name, st.session_state.vald_profiles)
     
+    # If no match found, show dropdown to manually select profile
     if not player_profile_id:
         st.warning(f"No VALD profile found for {player_name}")
+        st.info("Please select a VALD profile from the dropdown below to view their force plate data:")
         
-        # Show available profiles for debugging
-        with st.expander("Available VALD Profiles (for debugging)", expanded=False):
-            profile_names = [profile['fullName'] for profile in st.session_state.vald_profiles.values()]
-            st.write(f"Found {len(profile_names)} profiles:")
-            for name in sorted(profile_names)[:20]:  # Show first 20
-                st.write(f"- {name}")
-        return
-    
-    st.success(f"Found VALD profile for {player_name}")
+        # Fetch last test dates for all profiles
+        with st.spinner("Loading last test dates for profiles..."):
+            # Get all test data from a far back date to find last test for each profile
+            token = get_access_token()
+            if token:
+                headers = {"Authorization": f"Bearer {token}"}
+                # Query from a date far back enough to get all recent tests
+                modified_date = "2025-01-01T00:00:00.000Z"
+                initial_url = f"{VALD_CONFIG['forcedecks_base_url']}/tests?tenantId={VALD_CONFIG['tenant_id']}&modifiedFromUtc={modified_date}"
+                
+                try:
+                    all_tests = []
+                    current_url = initial_url
+                    page_count = 0
+                    max_pages = 50  # Limit to avoid long load times
+                    
+                    while current_url and page_count < max_pages:
+                        page_count += 1
+                        response = requests.get(current_url, headers=headers)
+                        
+                        if response.status_code == 204:
+                            break
+                        
+                        if response.ok:
+                            try:
+                                data = response.json()
+                                tests = data if isinstance(data, list) else data.get("tests", [])
+                                
+                                if len(tests) > 0:
+                                    all_tests.extend(tests)
+                                    
+                                    last_test = tests[-1]
+                                    last_modified = last_test.get('modifiedDateUtc')
+                                    if last_modified:
+                                        from datetime import datetime, timedelta
+                                        last_dt = datetime.fromisoformat(last_modified.replace('Z', '+00:00'))
+                                        next_dt = last_dt + timedelta(microseconds=1)
+                                        next_modified = next_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')[:-3] + 'Z'
+                                        current_url = f"{VALD_CONFIG['forcedecks_base_url']}/tests?tenantId={VALD_CONFIG['tenant_id']}&modifiedFromUtc={next_modified}"
+                                    else:
+                                        current_url = None
+                                else:
+                                    break
+                            except Exception:
+                                break
+                        else:
+                            break
+                    
+                    # Build dictionary of last test dates by profile ID
+                    profile_last_test = {}
+                    if all_tests:
+                        tests_df = pd.DataFrame(all_tests)
+                        if 'modifiedDateUtc' in tests_df.columns and 'profileId' in tests_df.columns:
+                            tests_df['modifiedDateUtc'] = pd.to_datetime(tests_df['modifiedDateUtc'], utc=True)
+                            
+                            # Get the most recent test date for each profile
+                            for profile_id in tests_df['profileId'].unique():
+                                profile_tests = tests_df[tests_df['profileId'] == profile_id]
+                                last_test_date = profile_tests['modifiedDateUtc'].max()
+                                if pd.notna(last_test_date):
+                                    profile_last_test[profile_id] = last_test_date.strftime('%m/%d/%y')
+                
+                except Exception as e:
+                    st.warning(f"Could not load last test dates: {str(e)}")
+                    profile_last_test = {}
+            else:
+                profile_last_test = {}
+        
+        # Create sorted list of profile names with IDs and last test dates
+        profile_options = {}
+        profile_display_names = []
+        
+        for profile_id, profile_data in st.session_state.vald_profiles.items():
+            profile_name = profile_data['fullName']
+            last_test = profile_last_test.get(profile_id, "No tests")
+            
+            # Create display name with last test date
+            display_name = f"{profile_name} (Last test: {last_test})"
+            profile_display_names.append(display_name)
+            profile_options[display_name] = profile_id
+        
+        sorted_display_names = sorted(profile_display_names)
+        
+        # Add a default "Select a profile..." option
+        profile_names_with_default = ["-- Select a profile --"] + sorted_display_names
+        
+        # Profile selector dropdown
+        selected_profile_display = st.selectbox(
+            "Select VALD Profile:",
+            options=profile_names_with_default,
+            key=f"vald_profile_select_{player_name}"
+        )
+        
+        # Check if a valid profile was selected
+        if selected_profile_display != "-- Select a profile --":
+            player_profile_id = profile_options[selected_profile_display]
+            # Extract just the name for display (remove the last test date part)
+            selected_profile_name = selected_profile_display.split(" (Last test:")[0]
+            st.success(f"Selected VALD profile: {selected_profile_name}")
+        else:
+            # Show available profiles for reference
+            with st.expander("Available VALD Profiles", expanded=False):
+                st.write(f"Found {len(sorted_display_names)} profiles:")
+                for display_name in sorted_display_names[:30]:  # Show first 30
+                    st.write(f"- {display_name}")
+            return
+    else:
+        st.success(f"Found VALD profile for {player_name}")
     
     # Date selection and exercise selection
     col1, col2 = st.columns([1, 1])
@@ -1277,11 +1378,13 @@ def display_player_force_plate_section(player_name):
         team_id = get_vald_team_id()
         
         with st.spinner("Loading force plate data..."):
-            # Get test summaries for this specific player
+            # Get test summaries for this specific player (using selected profile ID)
             df = fetch_player_forcedecks_tests(player_profile_id, force_plate_date.strftime('%Y-%m-%d'))
             
             if not df.empty:
-                st.success(f"Found {len(df)} tests for {player_name}")
+                # Get the actual profile name for display
+                selected_profile_name = st.session_state.vald_profiles[player_profile_id]['fullName']
+                st.success(f"Found {len(df)} tests for {selected_profile_name}")
                 
                 # Get trial data
                 test_ids = df['testId'].unique().tolist()
@@ -1294,18 +1397,58 @@ def display_player_force_plate_section(player_name):
                     if not perf_df.empty:
                         # Store in session state
                         st.session_state[f'fp_data_{player_name}'] = perf_df
+                        st.session_state[f'fp_raw_data_{player_name}'] = {
+                            'tests': df,
+                            'trials': trials_df
+                        }
                         st.success(f"Loaded {len(perf_df)} performance measurements")
                     else:
                         st.error("No performance metrics extracted from trial data")
                 else:
                     st.error("No trial data found")
             else:
-                st.warning(f"No test data found for {player_name} from {force_plate_date}")
+                selected_profile_name = st.session_state.vald_profiles[player_profile_id]['fullName']
+                st.warning(f"No test data found for {selected_profile_name} from {force_plate_date}")
     
     # Display Force Plate data if available
     if f'fp_data_{player_name}' in st.session_state:
         perf_df = st.session_state[f'fp_data_{player_name}']
-        display_selected_exercise_analysis(perf_df, player_name, exercise_code, selected_exercise)
+        
+        # Get the display name (either matched player or selected profile)
+        if player_profile_id in st.session_state.vald_profiles:
+            display_name = st.session_state.vald_profiles[player_profile_id]['fullName']
+        else:
+            display_name = player_name
+        
+        # Add download button for the data
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            # Download performance metrics CSV
+            csv_data = perf_df.to_csv(index=False)
+            st.download_button(
+                label="Download Force Plate Data",
+                data=csv_data,
+                file_name=f"{display_name.replace(' ', '_')}_force_plate_metrics_{force_plate_date}.csv",
+                mime="text/csv",
+                key=f"download_perf_{player_name}"
+            )
+        
+        with col2:
+            # Download raw trial data if available
+            if f'fp_raw_data_{player_name}' in st.session_state:
+                raw_data = st.session_state[f'fp_raw_data_{player_name}']
+                trials_csv = raw_data['trials'].to_csv(index=False)
+                st.download_button(
+                    label="📋 Download Raw Trial Data",
+                    data=trials_csv,
+                    file_name=f"{display_name.replace(' ', '_')}_raw_trials_{force_plate_date}.csv",
+                    mime="text/csv",
+                    key=f"download_raw_{player_name}"
+                )
+        
+        # Display the analysis
+        display_selected_exercise_analysis(perf_df, display_name, exercise_code, selected_exercise)
 
 def get_daily_values_for_metric(exercise_data, metric, exercise_code):
     """Get daily values for a metric - all repeats for HJ, max for others"""
