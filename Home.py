@@ -1406,6 +1406,9 @@ def create_leaderboard_dashboard(perf_df, bonnies_players):
         st.warning("No performance data available")
         return
     
+    # Initialize player_name column first
+    perf_df['player_name'] = None
+    
     # Add player names - try to match with CSV, but fallback to VALD profile names
     if 'name_to_profile_id' in st.session_state and st.session_state.name_to_profile_id:
         # Try to match using CSV names
@@ -1428,7 +1431,7 @@ def create_leaderboard_dashboard(perf_df, bonnies_players):
         st.error("No player names could be assigned to the data")
         return
     
-    # Add handedness - try from CSV first, default to 'Unknown'
+    # Add handedness - try from CSV first, default to 'RHP'
     if bonnies_players:
         name_to_handedness = {name: info['handedness'] for name, info in bonnies_players.items()}
         perf_df['handedness'] = perf_df['player_name'].map(name_to_handedness)
